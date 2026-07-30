@@ -60,33 +60,13 @@ D-Bus client.
 
 ## RBAC
 
-The shim needs to `exec` into its own pod via the Kubernetes API - scope
-this as tightly as your cluster allows, e.g. restricted to the pod's own
-name via `resourceNames` if you template that per-pod, or namespace-wide
-`pods/exec` if simpler:
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: systemd1-shim-exec
-rules:
-  - apiGroups: [""]
-    resources: ["pods/exec"]
-    verbs: ["create"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: systemd1-shim-exec
-subjects:
-  - kind: ServiceAccount
-    name: my-workload-sa # match spec.serviceAccountName above
-roleRef:
-  kind: Role
-  name: systemd1-shim-exec
-  apiGroup: rbac.authorization.k8s.io
-```
+The shim needs to `exec` into its own pod via the Kubernetes API. See
+[k8s_restart_sa.yaml](k8s_restart_sa.yaml) for a ready-to-apply
+ServiceAccount/Role/RoleBinding - point `spec.serviceAccountName` at its
+ServiceAccount. Scope the Role as tightly as your cluster allows, e.g.
+restricted to the pod's own name via `resourceNames` if you template
+that per-pod (see the commented-out line in the manifest), or
+namespace-wide `pods/exec` if simpler.
 
 ## Limitations
 

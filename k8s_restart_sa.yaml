@@ -1,0 +1,33 @@
+# Permissions the "k8s" hook needs: a ServiceAccount for the workload
+# pod, and a Role/RoleBinding granting it `create` on `pods/exec` so
+# k8s_restart.go can exec into a sibling container. See k8s_restarter.md.
+#
+# Apply in the same namespace as the pod (kubectl apply -n <ns> -f ...),
+# and set spec.serviceAccountName on the pod to the ServiceAccount below.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-workload-sa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: systemd1-shim-exec
+rules:
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+    # Restrict to specific pod names if you template this per-pod:
+    # resourceNames: ["my-pod-name"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: systemd1-shim-exec
+subjects:
+  - kind: ServiceAccount
+    name: my-workload-sa
+roleRef:
+  kind: Role
+  name: systemd1-shim-exec
+  apiGroup: rbac.authorization.k8s.io
