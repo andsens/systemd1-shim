@@ -12,8 +12,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/docopt/docopt-go"
 	"github.com/godbus/dbus/v5"
 )
 
@@ -23,10 +25,34 @@ func logf(format string, args ...interface{}) {
 	log.Printf("[systemd1-shim] "+format, args...)
 }
 
+// usageDoc is both the --help text and the docopt grammar it's parsed
+// against - the two can't drift apart. %s is filled in with the
+// currently registered hook names (hook.go) so --help always lists
+// exactly what --hook will actually accept.
+const usageDoc = `systemd1-shim - fake org.freedesktop.systemd1 D-Bus service
+
+Usage:
+  systemd1-shim [--hook=<name>]
+  systemd1-shim -h | --help
+
+Options:
+  -h --help      Show this help.
+  --hook=<name>  Which hook to load for reacting to unit start/stop/restart/
+                 kill commands [default: k8s]. Available: %s.
+`
+
 func main() {
-	cfg, err := loadConfig()
+	var cliArgs struct {
+		Hook string `docopt:"--hook"`
+	}
+	usage := fmt.Sprintf(usageDoc, strings.Join(hookNames(), ", "))
+	opts, err := docopt.ParseArgs(usage, os.Args[1:], "")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "systemd1-shim: loading config:", err)
+		fmt.Fprintln(os.Stderr, "systemd1-shim: parsing arguments:", err)
+		os.Exit(1)
+	}
+	if err := opts.Bind(&cliArgs); err != nil {
+		fmt.Fprintln(os.Stderr, "systemd1-shim: binding arguments:", err)
 		os.Exit(1)
 	}
 
@@ -51,13 +77,13 @@ func main() {
 	}
 
 	units := newUnitRegistry(conn)
-	restarter, err := NewK8sRestarter(cfg)
+	hook, err := loadHook(cliArgs.Hook)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "systemd1-shim: setting up Kubernetes client:", err)
+		fmt.Fprintln(os.Stderr, "systemd1-shim: loading hook:", err)
 		os.Exit(1)
 	}
 
-	manager, err := newManager(conn, units, restarter)
+	manager, err := newManager(conn, units, hook)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "systemd1-shim: exporting Manager:", err)
 		os.Exit(1)
@@ -67,8 +93,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	logf("claimed %s, pod=%s namespace=%s, %d unit->container overrides loaded",
-		busName, cfg.PodName, cfg.Namespace, len(cfg.UnitContainers))
+	logf("claimed %s, hook=%s", busName, cliArgs.Hook)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

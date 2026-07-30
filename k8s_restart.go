@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,12 +17,13 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-// K8sRestarter implements Restarter using the Kubernetes API's pod/exec
-// subresource directly (the client-go equivalent of `kubectl exec`),
-// rather than shelling out to a `kubectl` binary. Needs to run with
-// in-cluster credentials (a mounted ServiceAccount token) and RBAC
-// granting `create` on `pods/exec` for its own pod - same permission
-// `kubectl exec` would need, just exercised without a subprocess.
+// K8sRestarter is the "k8s" Hook: it reacts to unit commands using the
+// Kubernetes API's pod/exec subresource directly (the client-go
+// equivalent of `kubectl exec`), rather than shelling out to a `kubectl`
+// binary. Needs to run with in-cluster credentials (a mounted
+// ServiceAccount token) and RBAC granting `create` on `pods/exec` for its
+// own pod - same permission `kubectl exec` would need, just exercised
+// without a subprocess.
 type K8sRestarter struct {
 	clientset      *kubernetes.Clientset
 	restConfig     *rest.Config
@@ -29,7 +33,16 @@ type K8sRestarter struct {
 	timeout        time.Duration
 }
 
-func NewK8sRestarter(cfg *Config) (*K8sRestarter, error) {
+func init() {
+	registerHook("k8s", func() (Hook, error) { return NewK8sRestarter() })
+}
+
+// NewK8sRestarter reads everything it needs from the environment - see
+// README.md's "Configuration (env vars)" table. It's all specific to this
+// hook (which pod/namespace to exec into, how to map a unit name to a
+// container), so it lives here rather than in some shared config layer
+// main.go would otherwise have to know about.
+func NewK8sRestarter() (*K8sRestarter, error) {
 	restConfig, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("loading in-cluster kubeconfig (are you actually running in a pod, with a ServiceAccount mounted?): %w", err)
@@ -38,14 +51,65 @@ func NewK8sRestarter(cfg *Config) (*K8sRestarter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("building Kubernetes clientset: %w", err)
 	}
+
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		logf("WARNING: POD_NAME is not set - wire it up via the Downward API " +
+			"(fieldRef: metadata.name) in the sidecar's env, see README.md. " +
+			"exec calls will fail until then.")
+	}
+	namespace := getenvDefault("POD_NAMESPACE", "default")
+
+	timeout := 30 * time.Second
+	if s := os.Getenv("EXEC_TIMEOUT_SECONDS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			timeout = time.Duration(n) * time.Second
+		}
+	}
+
+	unitContainers, err := loadUnitContainerMap()
+	if err != nil {
+		return nil, err
+	}
+
 	return &K8sRestarter{
 		clientset:      clientset,
 		restConfig:     restConfig,
-		podName:        cfg.PodName,
-		namespace:      cfg.Namespace,
-		unitContainers: cfg.UnitContainers,
-		timeout:        cfg.ExecTimeout,
+		podName:        podName,
+		namespace:      namespace,
+		unitContainers: unitContainers,
+		timeout:        timeout,
 	}, nil
+}
+
+// loadUnitContainerMap reads UNIT_CONTAINER_MAP_FILE (a JSON file
+// {"unifi-network.service": "network-app", ...}) if set, and normalizes
+// its keys to always carry the ".service" suffix so lookups in
+// containerFor (which always looks up the normalized name) hit regardless
+// of how the user wrote the mapping file.
+func loadUnitContainerMap() (map[string]string, error) {
+	raw := map[string]string{}
+	if path := os.Getenv("UNIT_CONTAINER_MAP_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+	}
+	normalized := make(map[string]string, len(raw))
+	for k, v := range raw {
+		normalized[normalizeUnitName(k)] = v
+	}
+	return normalized, nil
+}
+
+func getenvDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func (k *K8sRestarter) containerFor(unitName string) string {
