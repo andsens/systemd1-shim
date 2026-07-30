@@ -5,7 +5,7 @@ go 1.26.5
 require (
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
-	github.com/godbus/dbus/v5 v5.1.0
+	github.com/godbus/dbus/v5 v5.2.2
 	k8s.io/api v0.30.0
 	k8s.io/client-go v0.30.0
 )
@@ -33,7 +33,7 @@ require (
 	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
 	golang.org/x/net v0.23.0 // indirect
 	golang.org/x/oauth2 v0.10.0 // indirect
-	golang.org/x/sys v0.18.0 // indirect
+	golang.org/x/sys v0.27.0 // indirect
 	golang.org/x/term v0.18.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
