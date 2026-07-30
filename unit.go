@@ -1,0 +1,251 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/godbus/dbus/v5"
+	"github.com/godbus/dbus/v5/introspect"
+	"github.com/godbus/dbus/v5/prop"
+)
+
+const (
+	unitIface    = "org.freedesktop.systemd1.Unit"
+	serviceIface = "org.freedesktop.systemd1.Service"
+	managerIface = "org.freedesktop.systemd1.Manager"
+)
+
+// unitPath turns "foo.service" (or "foo") into a stable, valid D-Bus object
+// path segment. Real systemd uses its own escaping scheme; we just need
+// something bijective and legal, not byte-compatible with real systemd.
+func unitPath(name string) dbus.ObjectPath {
+	base := strings.TrimSuffix(name, ".service")
+	var b strings.Builder
+	for _, r := range base {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			fmt.Fprintf(&b, "_%02x", r)
+		}
+	}
+	return dbus.ObjectPath("/org/freedesktop/systemd1/unit/" + b.String())
+}
+
+// Unit is one faked systemd unit: an exported D-Bus object at unitPath(name)
+// implementing org.freedesktop.systemd1.Unit and org.freedesktop.systemd1.Service
+// properties (backed by godbus's prop.Properties helper so Get/GetAll/
+// PropertiesChanged are handled for us), plus a handful of Unit-interface
+// methods (GetUnitFileState, Describe, Reload, Freeze, Thaw) mirroring
+// fakesystemD's surface.
+type Unit struct {
+	Name   string // e.g. "unifi-network.service"
+	Path   dbus.ObjectPath
+	conn   *dbus.Conn
+	props  *prop.Properties
+	masked bool
+}
+
+func newUnit(conn *dbus.Conn, name string) (*Unit, error) {
+	if !strings.HasSuffix(name, ".service") {
+		name += ".service"
+	}
+	path := unitPath(name)
+
+	propsSpec := prop.Map{
+		unitIface: {
+			"Id":            {Value: name, Writable: false, Emit: prop.EmitFalse, Callback: nil},
+			"LoadState":     {Value: "loaded", Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"ActiveState":   {Value: "active", Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"SubState":      {Value: "running", Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"Description":   {Value: "Auto-created unit " + name, Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"UnitFileState": {Value: "enabled", Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"Following":     {Value: "", Writable: false, Emit: prop.EmitFalse, Callback: nil},
+			"LoadError":     {Value: "", Writable: false, Emit: prop.EmitTrue, Callback: nil},
+		},
+		serviceIface: {
+			"StatusText":    {Value: "", Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"MainPID":       {Value: uint32(0), Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"MemoryCurrent": {Value: uint64(0), Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"CPUUsageNSec":  {Value: uint64(0), Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"TasksCurrent":  {Value: uint32(0), Writable: false, Emit: prop.EmitTrue, Callback: nil},
+			"ExecPath":      {Value: "", Writable: false, Emit: prop.EmitFalse, Callback: nil},
+		},
+	}
+	p, err := prop.Export(conn, path, propsSpec)
+	if err != nil {
+		return nil, fmt.Errorf("exporting properties for %s: %w", name, err)
+	}
+
+	if err := conn.Export(introspect.NewIntrospectable(unitIntrospectNode(path)), path, "org.freedesktop.DBus.Introspectable"); err != nil {
+		return nil, err
+	}
+
+	u := &Unit{Name: name, Path: path, conn: conn, props: p}
+
+	// Unit-interface methods (GetUnitFileState, Describe, Reload, Freeze,
+	// Thaw - see unit_extra.go), exported for dispatch the same way
+	// Manager's methods are.
+	if err := conn.Export(u, path, unitIface); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func (u *Unit) setActiveState(state, subState string) {
+	u.props.SetMust(unitIface, "ActiveState", state)
+	u.props.SetMust(unitIface, "SubState", subState)
+}
+
+func (u *Unit) setStatusText(text string) {
+	u.props.SetMust(serviceIface, "StatusText", text)
+}
+
+func (u *Unit) setMainPID(pid uint32) {
+	u.props.SetMust(serviceIface, "MainPID", pid)
+}
+
+func unitIntrospectNode(path dbus.ObjectPath) *introspect.Node {
+	arg := func(name, typ, dir string) introspect.Arg {
+		return introspect.Arg{Name: name, Type: typ, Direction: dir}
+	}
+	return &introspect.Node{
+		Name: string(path),
+		Interfaces: []introspect.Interface{
+			introspect.IntrospectData,
+			prop.IntrospectData,
+			{
+				Name: unitIface,
+				Methods: []introspect.Method{
+					{Name: "GetUnitFileState", Args: []introspect.Arg{arg("state", "s", "out")}},
+					{Name: "Describe", Args: []introspect.Arg{arg("props", "a{sv}", "out")}},
+					{Name: "Reload", Args: []introspect.Arg{arg("mode", "s", "in")}},
+					{Name: "Freeze", Args: []introspect.Arg{arg("mode", "s", "in")}},
+					{Name: "Thaw"},
+				},
+				Properties: []introspect.Property{
+					{Name: "Id", Type: "s", Access: "read"},
+					{Name: "LoadState", Type: "s", Access: "read"},
+					{Name: "ActiveState", Type: "s", Access: "read"},
+					{Name: "SubState", Type: "s", Access: "read"},
+					{Name: "Description", Type: "s", Access: "read"},
+					{Name: "UnitFileState", Type: "s", Access: "read"},
+					{Name: "Following", Type: "s", Access: "read"},
+					{Name: "LoadError", Type: "s", Access: "read"},
+				},
+			},
+			{
+				Name: serviceIface,
+				Properties: []introspect.Property{
+					{Name: "StatusText", Type: "s", Access: "read"},
+					{Name: "MainPID", Type: "u", Access: "read"},
+					{Name: "MemoryCurrent", Type: "t", Access: "read"},
+					{Name: "CPUUsageNSec", Type: "t", Access: "read"},
+					{Name: "TasksCurrent", Type: "u", Access: "read"},
+				},
+			},
+		},
+	}
+}
+
+// UnitRegistry is the shared, lazily-populated map of unit name -> Unit.
+type UnitRegistry struct {
+	mu    sync.Mutex
+	conn  *dbus.Conn
+	units map[string]*Unit // keyed by normalized "name.service"
+}
+
+func newUnitRegistry(conn *dbus.Conn) *UnitRegistry {
+	return &UnitRegistry{conn: conn, units: make(map[string]*Unit)}
+}
+
+func normalizeUnitName(name string) string {
+	if !strings.HasSuffix(name, ".service") {
+		return name + ".service"
+	}
+	return name
+}
+
+// getOrCreate returns the Unit for name, exporting a new D-Bus object for it
+// the first time it's seen. This mirrors LoadUnit's real semantics of
+// "load if not already loaded" - we don't distinguish loaded/not-loaded,
+// everything just springs into existence on first reference, defaulting to
+// a healthy state (see README for why that default was chosen).
+func (r *UnitRegistry) getOrCreate(name string) (*Unit, error) {
+	key := normalizeUnitName(name)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if u, ok := r.units[key]; ok {
+		return u, nil
+	}
+	u, err := newUnit(r.conn, key)
+	if err != nil {
+		return nil, err
+	}
+	r.units[key] = u
+	return u, nil
+}
+
+func (r *UnitRegistry) get(name string) (*Unit, bool) {
+	key := normalizeUnitName(name)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.units[key]
+	return u, ok
+}
+
+// all returns every currently-known unit. Safe to call while other
+// goroutines are creating new units - it snapshots under the lock.
+func (r *UnitRegistry) all() []*Unit {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*Unit, 0, len(r.units))
+	for _, u := range r.units {
+		out = append(out, u)
+	}
+	return out
+}
+
+// --- Jobs ---
+//
+// Real systemd represents every asynchronous unit operation (start/stop/
+// restart) as a Job object, and `systemctl` (when not run with --no-block)
+// waits for a JobRemoved signal naming that exact job before it exits. We
+// don't need real concurrency here - each job we "create" runs its action
+// to completion (synchronously, e.g. the kubectl exec call) and then
+// immediately emits JobRemoved, but we still have to go through the
+// motions (return a job path from Start/Stop/RestartUnit, emit JobNew,
+// then JobRemoved) or `systemctl restart` will hang forever waiting for a
+// signal that never comes.
+
+var jobIDCounter uint32
+
+func nextJobID() uint32 {
+	return atomic.AddUint32(&jobIDCounter, 1)
+}
+
+func jobPath(id uint32) dbus.ObjectPath {
+	return dbus.ObjectPath(fmt.Sprintf("/org/freedesktop/systemd1/job/%d", id))
+}
+
+// runJob emits JobNew, runs action synchronously, emits JobRemoved with
+// "done" or "failed", and returns the job path (for the method call's
+// return value) - errors from action are logged but not returned to the
+// D-Bus caller, matching how systemctl expects to learn about failure
+// (via the job result string, not a method error).
+func runJob(conn *dbus.Conn, unitName string, action func() error) dbus.ObjectPath {
+	id := nextJobID()
+	path := jobPath(id)
+
+	_ = conn.Emit(managerPath, managerIface+".JobNew", id, path, unitName)
+
+	result := "done"
+	if err := action(); err != nil {
+		logf("job %d (%s) failed: %v", id, unitName, err)
+		result = "failed"
+	}
+
+	_ = conn.Emit(managerPath, managerIface+".JobRemoved", id, path, unitName, result)
+	return path
+}
