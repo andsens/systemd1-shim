@@ -1,4 +1,4 @@
-package main
+package hooks
 
 import (
 	"bytes"
@@ -35,7 +35,7 @@ type K8sRestarter struct {
 }
 
 func init() {
-	registerHook("k8s", func() (Hook, error) { return NewK8sRestarter() })
+	register("k8s", func() (Hook, error) { return NewK8sRestarter() })
 }
 
 // NewK8sRestarter reads everything it needs from the environment - see
@@ -81,6 +81,17 @@ func NewK8sRestarter() (*K8sRestarter, error) {
 		unitContainers: unitContainers,
 		timeout:        timeout,
 	}, nil
+}
+
+// normalizeUnitName mirrors main package's unit.go copy - kept local
+// rather than shared, since hooks can't import main (main imports
+// hooks) and this is a four-line pure function, not worth a third
+// package just to share it.
+func normalizeUnitName(name string) string {
+	if !strings.HasSuffix(name, ".service") {
+		return name + ".service"
+	}
+	return name
 }
 
 // loadUnitContainerMap reads UNIT_CONTAINER_MAP_FILE if set, and

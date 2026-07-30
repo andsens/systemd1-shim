@@ -1,8 +1,10 @@
 # The `k8s` hook
 
-`k8s_restart.go`'s `K8sRestarter` is the default [Hook](README.md#hooks).
-It execs into a sibling container via the Kubernetes API's pod/exec
-subresource directly (`k8s.io/client-go`) - the client-go equivalent of
+`k8s_restarter.go`'s `K8sRestarter` is the [Hook](../README.md#hooks) that
+makes `systemctl restart` actually restart something - select it with
+`--hook=k8s` (the default is `noop`, which does nothing). It execs into
+a sibling container via the Kubernetes API's pod/exec subresource
+directly (`k8s.io/client-go`) - the client-go equivalent of
 `kubectl exec`, no `kubectl` binary or subprocess needed.
 
 `Restart`/`Stop`/`Kill` send `/sbin/killall5` (sysvinit-utils) into the
@@ -61,7 +63,7 @@ D-Bus client.
 ## RBAC
 
 The shim needs to `exec` into its own pod via the Kubernetes API. See
-[k8s_restart_sa.yaml](k8s_restart_sa.yaml) for a ready-to-apply
+[k8s_restarter_sa.yaml](k8s_restarter_sa.yaml) for a ready-to-apply
 ServiceAccount/Role/RoleBinding - point `spec.serviceAccountName` at its
 ServiceAccount. Scope the Role as tightly as your cluster allows, e.g.
 restricted to the pod's own name via `resourceNames` if you template
@@ -73,5 +75,5 @@ namespace-wide `pods/exec` if simpler.
 - **`killall5 -15` is a blunt instrument** - it signals every process in
   the target container except PID 1. Fine if that container runs exactly
   one supervised service; less fine if it runs several. Adjust
-  `Restart`/`Stop`/`Kill` in `k8s_restart.go` if you need more precision
+  `Restart`/`Stop`/`Kill` in `k8s_restarter.go` if you need more precision
   (e.g. a specific process name, or exec'ing a supervisor CLI instead).

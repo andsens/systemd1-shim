@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/introspect"
 	"github.com/godbus/dbus/v5/prop"
+
+	systemddbus "github.com/coreos/go-systemd/v22/dbus"
 )
 
 const (
@@ -18,20 +19,13 @@ const (
 	managerIface = "org.freedesktop.systemd1.Manager"
 )
 
-// unitPath turns "foo.service" (or "foo") into a stable, valid D-Bus object
-// path segment. Real systemd uses its own escaping scheme; we just need
-// something bijective and legal, not byte-compatible with real systemd.
+// unitPath turns "foo.service" (or "foo") into a D-Bus object path
+// segment, using systemd's own escaping algorithm (PathBusEscape - the
+// same one kubelet uses when it talks to systemd over D-Bus), so this
+// stays byte-compatible with real systemd rather than just legal.
 func unitPath(name string) dbus.ObjectPath {
 	base := strings.TrimSuffix(name, ".service")
-	var b strings.Builder
-	for _, r := range base {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-		} else {
-			fmt.Fprintf(&b, "_%02x", r)
-		}
-	}
-	return dbus.ObjectPath("/org/freedesktop/systemd1/unit/" + b.String())
+	return dbus.ObjectPath("/org/freedesktop/systemd1/unit/" + systemddbus.PathBusEscape(base))
 }
 
 // Unit is one faked systemd unit, exported as a D-Bus object at
@@ -90,14 +84,6 @@ func newUnit(conn *dbus.Conn, name string) (*Unit, error) {
 func (u *Unit) setActiveState(state, subState string) {
 	u.props.SetMust(unitIface, "ActiveState", state)
 	u.props.SetMust(unitIface, "SubState", subState)
-}
-
-func (u *Unit) setStatusText(text string) {
-	u.props.SetMust(serviceIface, "StatusText", text)
-}
-
-func (u *Unit) setMainPID(pid uint32) {
-	u.props.SetMust(serviceIface, "MainPID", pid)
 }
 
 // Nothing in a plain systemctl enable/disable/restart/mask/unmask/kill
@@ -181,62 +167,6 @@ func unitIntrospectNode(path dbus.ObjectPath) *introspect.Node {
 			},
 		},
 	}
-}
-
-// UnitRegistry is the shared, lazily-populated map of unit name -> Unit.
-type UnitRegistry struct {
-	mu    sync.Mutex
-	conn  *dbus.Conn
-	units map[string]*Unit // keyed by normalized "name.service"
-}
-
-func newUnitRegistry(conn *dbus.Conn) *UnitRegistry {
-	return &UnitRegistry{conn: conn, units: make(map[string]*Unit)}
-}
-
-func normalizeUnitName(name string) string {
-	if !strings.HasSuffix(name, ".service") {
-		return name + ".service"
-	}
-	return name
-}
-
-// getOrCreate doesn't distinguish loaded/not-loaded like real systemd
-// does - everything springs into existence on first reference, defaulting
-// to a healthy state (see README for why).
-func (r *UnitRegistry) getOrCreate(name string) (*Unit, error) {
-	key := normalizeUnitName(name)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if u, ok := r.units[key]; ok {
-		return u, nil
-	}
-	u, err := newUnit(r.conn, key)
-	if err != nil {
-		return nil, err
-	}
-	r.units[key] = u
-	return u, nil
-}
-
-func (r *UnitRegistry) get(name string) (*Unit, bool) {
-	key := normalizeUnitName(name)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	u, ok := r.units[key]
-	return u, ok
-}
-
-// all snapshots under the lock, so it's safe to call while other
-// goroutines are creating units.
-func (r *UnitRegistry) all() []*Unit {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]*Unit, 0, len(r.units))
-	for _, u := range r.units {
-		out = append(out, u)
-	}
-	return out
 }
 
 // `systemctl` (without --no-block) waits for a JobRemoved signal naming

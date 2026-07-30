@@ -4,10 +4,14 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/introspect"
 	"github.com/godbus/dbus/v5/prop"
+
+	"github.com/andsens/systemd1-shim/hooks"
 )
 
 const managerPath = dbus.ObjectPath("/org/freedesktop/systemd1")
@@ -22,39 +26,28 @@ const managerPath = dbus.ObjectPath("/org/freedesktop/systemd1")
 // contents for our purposes - it's fine for this to always come back
 // empty; only the *shape* needs to be right so the reply decodes.
 type UnitFileChange struct {
-	Type        string
-	File        string
-	Destination string
+	Type, File, Destination string
 }
 
 // UnitListEntry: a(ssssssouso) - ListUnits / ListUnitsFiltered.
 type UnitListEntry struct {
-	Name        string
-	Description string
-	LoadState   string
-	ActiveState string
-	SubState    string
-	Following   string
-	UnitPath    dbus.ObjectPath
-	JobID       uint32
-	JobType     string
-	JobPath     dbus.ObjectPath
+	Name, Description, LoadState, ActiveState, SubState, Following string
+	UnitPath                                                       dbus.ObjectPath
+	JobID                                                          uint32
+	JobType                                                        string
+	JobPath                                                        dbus.ObjectPath
 }
 
 // UnitFileEntry: a(ss) - ListUnitFiles.
 type UnitFileEntry struct {
-	Path  string
-	State string
+	Path, State string
 }
 
 // JobListEntry: a(usssoo) - ListJobs.
 type JobListEntry struct {
-	ID       uint32
-	Unit     string
-	JobType  string
-	State    string
-	JobPath  dbus.ObjectPath
-	UnitPath dbus.ObjectPath
+	ID                   uint32
+	Unit, JobType, State string
+	JobPath, UnitPath    dbus.ObjectPath
 }
 
 // PropertyAssignment: a(sv) - SetUnitProperties input.
@@ -70,9 +63,9 @@ type ProcessEntry struct {
 	CommandLine  string
 }
 
-// propString/propUint32 read a property's current value back out of a
+// propString reads a property's current value back out of a
 // prop.Properties instance, for the listing methods below that need to
-// report current state (ListUnits, GetUnitByPID, ...).
+// report current state (ListUnits, ...).
 func propString(p *prop.Properties, iface, name string) (string, error) {
 	v, derr := p.Get(iface, name)
 	if derr != nil {
@@ -80,15 +73,6 @@ func propString(p *prop.Properties, iface, name string) (string, error) {
 	}
 	s, _ := v.Value().(string)
 	return s, nil
-}
-
-func propUint32(p *prop.Properties, iface, name string) (uint32, error) {
-	v, derr := p.Get(iface, name)
-	if derr != nil {
-		return 0, derr
-	}
-	u, _ := v.Value().(uint32)
-	return u, nil
 }
 
 func errNoSuchUnitForPID(pid uint32) error {
@@ -105,13 +89,15 @@ func errNoSuchJob(id uint32) error {
 // name being invoked.
 type Manager struct {
 	conn  *dbus.Conn
-	units *UnitRegistry
-	hook  Hook
+	hook  hooks.Hook
 	props *prop.Properties
+
+	mu    sync.Mutex
+	units map[string]*Unit // keyed by normalized "name.service"
 }
 
-func newManager(conn *dbus.Conn, units *UnitRegistry, hook Hook) (*Manager, error) {
-	m := &Manager{conn: conn, units: units, hook: hook}
+func newManager(conn *dbus.Conn, hook hooks.Hook) (*Manager, error) {
+	m := &Manager{conn: conn, hook: hook, units: make(map[string]*Unit)}
 
 	propsSpec := prop.Map{
 		managerIface: {
@@ -137,6 +123,51 @@ func newManager(conn *dbus.Conn, units *UnitRegistry, hook Hook) (*Manager, erro
 	return m, nil
 }
 
+func normalizeUnitName(name string) string {
+	if !strings.HasSuffix(name, ".service") {
+		return name + ".service"
+	}
+	return name
+}
+
+// getOrCreateUnit doesn't distinguish loaded/not-loaded like real systemd
+// does - everything springs into existence on first reference, defaulting
+// to a healthy state (see README for why).
+func (m *Manager) getOrCreateUnit(name string) (*Unit, error) {
+	key := normalizeUnitName(name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if u, ok := m.units[key]; ok {
+		return u, nil
+	}
+	u, err := newUnit(m.conn, key)
+	if err != nil {
+		return nil, err
+	}
+	m.units[key] = u
+	return u, nil
+}
+
+func (m *Manager) getUnit(name string) (*Unit, bool) {
+	key := normalizeUnitName(name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.units[key]
+	return u, ok
+}
+
+// allUnits snapshots under the lock, so it's safe to call while other
+// goroutines are creating units.
+func (m *Manager) allUnits() []*Unit {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*Unit, 0, len(m.units))
+	for _, u := range m.units {
+		out = append(out, u)
+	}
+	return out
+}
+
 // --- Methods actually reachable from real systemctl invocations and other D-Bus clients ---
 
 func (m *Manager) Subscribe() *dbus.Error {
@@ -150,7 +181,7 @@ func (m *Manager) Unsubscribe() *dbus.Error {
 }
 
 func (m *Manager) LoadUnit(name string) (dbus.ObjectPath, *dbus.Error) {
-	u, err := m.units.getOrCreate(name)
+	u, err := m.getOrCreateUnit(name)
 	if err != nil {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -165,7 +196,7 @@ func (m *Manager) GetUnit(name string) (dbus.ObjectPath, *dbus.Error) {
 }
 
 func (m *Manager) StartUnit(name, mode string) (dbus.ObjectPath, *dbus.Error) {
-	u, err := m.units.getOrCreate(name)
+	u, err := m.getOrCreateUnit(name)
 	if err != nil {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -181,7 +212,7 @@ func (m *Manager) StartUnit(name, mode string) (dbus.ObjectPath, *dbus.Error) {
 }
 
 func (m *Manager) StopUnit(name, mode string) (dbus.ObjectPath, *dbus.Error) {
-	u, err := m.units.getOrCreate(name)
+	u, err := m.getOrCreateUnit(name)
 	if err != nil {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -194,7 +225,7 @@ func (m *Manager) StopUnit(name, mode string) (dbus.ObjectPath, *dbus.Error) {
 }
 
 func (m *Manager) RestartUnit(name, mode string) (dbus.ObjectPath, *dbus.Error) {
-	u, err := m.units.getOrCreate(name)
+	u, err := m.getOrCreateUnit(name)
 	if err != nil {
 		return "", dbus.MakeFailedError(err)
 	}
@@ -212,7 +243,7 @@ func (m *Manager) RestartUnit(name, mode string) (dbus.ObjectPath, *dbus.Error) 
 // KillUnit is synchronous in real systemd too (no Job) - matches
 // `systemctl kill <unit>.service`, default whom="all" signal=SIGTERM(15).
 func (m *Manager) KillUnit(name, whom string, signal int32) *dbus.Error {
-	u, err := m.units.getOrCreate(name)
+	u, err := m.getOrCreateUnit(name)
 	if err != nil {
 		return dbus.MakeFailedError(err)
 	}
@@ -225,7 +256,7 @@ func (m *Manager) KillUnit(name, whom string, signal int32) *dbus.Error {
 
 func (m *Manager) EnableUnitFiles(files []string, runtime, force bool) (bool, []UnitFileChange, *dbus.Error) {
 	for _, f := range files {
-		if u, err := m.units.getOrCreate(f); err == nil {
+		if u, err := m.getOrCreateUnit(f); err == nil {
 			u.masked = false
 		}
 	}
@@ -238,7 +269,7 @@ func (m *Manager) DisableUnitFiles(files []string, runtime bool) ([]UnitFileChan
 
 func (m *Manager) MaskUnitFiles(files []string, runtime, force bool) ([]UnitFileChange, *dbus.Error) {
 	for _, f := range files {
-		u, err := m.units.getOrCreate(f)
+		u, err := m.getOrCreateUnit(f)
 		if err != nil {
 			return nil, dbus.MakeFailedError(err)
 		}
@@ -250,7 +281,7 @@ func (m *Manager) MaskUnitFiles(files []string, runtime, force bool) ([]UnitFile
 
 func (m *Manager) UnmaskUnitFiles(files []string, runtime bool) ([]UnitFileChange, *dbus.Error) {
 	for _, f := range files {
-		if u, ok := m.units.get(f); ok {
+		if u, ok := m.getUnit(f); ok {
 			u.masked = false
 		}
 	}
@@ -313,21 +344,21 @@ func (m *Manager) Reexecute() *dbus.Error {
 }
 
 func (m *Manager) ResetFailedUnit(name string) *dbus.Error {
-	if u, ok := m.units.get(name); ok {
+	if u, ok := m.getUnit(name); ok {
 		u.setActiveState("active", "running")
 	}
 	return nil
 }
 
 func (m *Manager) GetUnitFileState(name string) (string, *dbus.Error) {
-	if u, ok := m.units.get(name); ok {
+	if u, ok := m.getUnit(name); ok {
 		return u.GetUnitFileState()
 	}
 	return "not-found", nil
 }
 
 func (m *Manager) ListUnitFiles() ([]UnitFileEntry, *dbus.Error) {
-	units := m.units.all()
+	units := m.allUnits()
 	out := make([]UnitFileEntry, 0, len(units))
 	for _, u := range units {
 		state := "enabled"
@@ -340,7 +371,7 @@ func (m *Manager) ListUnitFiles() ([]UnitFileEntry, *dbus.Error) {
 }
 
 func (m *Manager) ListUnits() ([]UnitListEntry, *dbus.Error) {
-	units := m.units.all()
+	units := m.allUnits()
 	out := make([]UnitListEntry, 0, len(units))
 	for _, u := range units {
 		activeState, _ := propString(u.props, unitIface, "ActiveState")
@@ -369,13 +400,12 @@ func (m *Manager) ListUnitsFiltered(states []string) ([]UnitListEntry, *dbus.Err
 	return m.ListUnits()
 }
 
+// GetUnitByPID / GetUnitProcesses: this shim never learns a unit's
+// MainPID - nothing here execs a process locally to observe one, and
+// hooks run out-of-process (see README.md). No PID is ever tracked, so
+// no PID can ever match and no process list is ever non-empty. Always
+// "not found" / empty is the honest answer, not a stub.
 func (m *Manager) GetUnitByPID(pid uint32) (dbus.ObjectPath, *dbus.Error) {
-	for _, u := range m.units.all() {
-		mainPID, _ := propUint32(u.props, serviceIface, "MainPID")
-		if mainPID == pid {
-			return u.Path, nil
-		}
-	}
 	return "", dbus.MakeFailedError(errNoSuchUnitForPID(pid))
 }
 
@@ -399,15 +429,7 @@ func (m *Manager) SetUnitProperties(name string, runtimeOnly bool, properties []
 }
 
 func (m *Manager) GetUnitProcesses(name string) ([]ProcessEntry, *dbus.Error) {
-	u, ok := m.units.get(name)
-	if !ok {
-		return []ProcessEntry{}, nil
-	}
-	pid, _ := propUint32(u.props, serviceIface, "MainPID")
-	if pid == 0 {
-		return []ProcessEntry{}, nil
-	}
-	return []ProcessEntry{{ControlGroup: "/" + u.Name, PID: pid, CommandLine: ""}}, nil
+	return []ProcessEntry{}, nil
 }
 
 func managerIntrospectNode() *introspect.Node {

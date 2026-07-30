@@ -40,7 +40,10 @@ most client libraries no-op if it's unset, which is the common case
 here), `ListJobs`/`GetJob` returning anything (every job runs to
 completion synchronously and emits `JobRemoved` before the creating call
 returns, so nothing is ever pending), persisted unit-file state (see
-Limitations).
+Limitations), `MainPID` tracking (nothing here execs a process locally
+to observe one - hooks run out-of-process - so `GetUnitByPID` never
+matches and `GetUnitProcesses` is always empty; `MainPID`/`StatusText`
+stay at their zero-value defaults).
 
 ## Build
 
@@ -55,7 +58,7 @@ work as a base image.
 ## Hooks
 
 Reacting to a D-Bus unit command is decoupled from the D-Bus/systemd
-surface via the `Hook` interface (`hook.go`):
+surface via the `Hook` interface, in its own package (`hooks/hook.go`):
 
 ```go
 type Hook interface {
@@ -71,14 +74,14 @@ registers itself by name in an `init()`:
 
 ```go
 func init() {
-	registerHook("k8s", func() (Hook, error) { return NewK8sRestarter() })
+	register("k8s", func() (Hook, error) { return NewK8sRestarter() })
 }
 ```
 
 Hooks load their own config (env vars, files, whatever they need) - there
 is no shared config type. Add a new hook by implementing `Hook` in a new
-file and registering it the same way; nothing in `manager.go` or
-`main.go` needs to change.
+file under `hooks/` and registering it the same way; nothing in
+`manager.go` or `main.go` needs to change.
 
 Which hook runs is picked at invocation time via
 [docopt](https://github.com/docopt/docopt-go):
@@ -90,8 +93,12 @@ systemd1-shim --help
 
 ### Available hooks
 
-- **`k8s`** (default) - execs into a sibling container via the
-  Kubernetes API. See [k8s_restarter.md](k8s_restarter.md).
+- **`noop`** (default) - does nothing beyond logging. No Kubernetes, no
+  external dependency of any kind - lets the D-Bus/systemctl-facing
+  surface run standalone. `--hook=k8s` is required for it to actually
+  restart anything.
+- **`k8s`** - execs into a sibling container via the Kubernetes API. See
+  [k8s_restarter.md](hooks/k8s_restarter.md).
 
 ## Configuration (env vars)
 
@@ -100,7 +107,7 @@ systemd1-shim --help
 | `DBUS_SYSTEM_BUS_ADDRESS` | _(godbus default)_ | Only needed if your dbus socket isn't at the usual path both sides expect. |
 
 Hook-specific env vars are documented alongside each hook - see
-[k8s_restarter.md](k8s_restarter.md) for the `k8s` hook's.
+[k8s_restarter.md](hooks/k8s_restarter.md) for the `k8s` hook's.
 
 ## Comparison to fakesystemD (Python)
 
@@ -114,7 +121,8 @@ Two functional differences remain:
    comes. This shim emits both for every job-creating call (`runJob()`
    in `unit.go`).
 2. **Real actions.** fakesystemD is a pure status mock; this shim's
-   hooks actually do something.
+   hooks *can* actually do something (see "Hooks" above) - the default
+   `noop` hook doesn't, but `--hook=k8s` does.
 
 ## Limitations
 

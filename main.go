@@ -13,7 +13,11 @@ import (
 
 	"github.com/docopt/docopt-go"
 	"github.com/godbus/dbus/v5"
+
+	"github.com/andsens/systemd1-shim/hooks"
 )
+
+const busName = "org.freedesktop.systemd1"
 
 func main() {
 	usage := fmt.Sprintf(`systemd1-shim - fake org.freedesktop.systemd1 D-Bus service
@@ -25,8 +29,8 @@ Usage:
 Options:
   -h --help      Show this help.
   --hook=<name>  Which hook to load for reacting to unit start/stop/restart/
-                 kill commands [default: k8s]. Available: %s.
-`, strings.Join(hookNames(), ", "))
+                 kill commands [default: noop]. Available: %s.
+`, strings.Join(hooks.Names(), ", "))
 	var cliArgs struct {
 		Hook string `docopt:"--hook"`
 	}
@@ -47,8 +51,6 @@ Options:
 	}
 	defer conn.Close()
 
-	const busName = "org.freedesktop.systemd1"
-
 	reply, err := conn.RequestName(busName, dbus.NameFlagDoNotQueue)
 	if err != nil {
 		slog.Error("requesting bus name", "error", err)
@@ -61,14 +63,13 @@ Options:
 		os.Exit(1)
 	}
 
-	units := newUnitRegistry(conn)
-	hook, err := loadHook(cliArgs.Hook)
+	hook, err := hooks.Load(cliArgs.Hook)
 	if err != nil {
 		slog.Error("loading hook", "error", err)
 		os.Exit(1)
 	}
 
-	manager, err := newManager(conn, units, hook)
+	manager, err := newManager(conn, hook)
 	if err != nil {
 		slog.Error("exporting Manager", "error", err)
 		os.Exit(1)

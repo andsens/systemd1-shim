@@ -14,11 +14,12 @@ package main
 // environment precondition, not a code problem.
 
 import (
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/godbus/dbus/v5"
+
+	"github.com/andsens/systemd1-shim/hooks"
 )
 
 const testBusName = "org.freedesktop.systemd1"
@@ -36,55 +37,12 @@ func connectTestBus(t *testing.T) *dbus.Conn {
 	return conn
 }
 
-// fakeHook records calls instead of touching Kubernetes, so tests assert
-// against Manager/Unit's D-Bus-facing behavior in isolation.
-type fakeHook struct {
-	mu                          sync.Mutex
-	started, stopped, restarted []string
-	killed                      []killCall
-	err                         error
-}
-
-type killCall struct {
-	unit   string
-	signal int
-}
-
-func (f *fakeHook) Start(unit string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.started = append(f.started, unit)
-	return f.err
-}
-
-func (f *fakeHook) Stop(unit string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.stopped = append(f.stopped, unit)
-	return f.err
-}
-
-func (f *fakeHook) Restart(unit string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.restarted = append(f.restarted, unit)
-	return f.err
-}
-
-func (f *fakeHook) Kill(unit string, signal int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.killed = append(f.killed, killCall{unit, signal})
-	return f.err
-}
-
 // newTestManager exports a Manager backed by hook on serverConn and
 // claims testBusName, so a separate client connection can address it the
 // same way `systemctl` addresses the real org.freedesktop.systemd1.
-func newTestManager(t *testing.T, serverConn *dbus.Conn, hook Hook) *Manager {
+func newTestManager(t *testing.T, serverConn *dbus.Conn, hook hooks.Hook) *Manager {
 	t.Helper()
-	units := newUnitRegistry(serverConn)
-	manager, err := newManager(serverConn, units, hook)
+	manager, err := newManager(serverConn, hook)
 	if err != nil {
 		t.Fatalf("newManager: %v", err)
 	}
@@ -103,7 +61,7 @@ func newTestManager(t *testing.T, serverConn *dbus.Conn, hook Hook) *Manager {
 
 func TestStartUnit_OverDBus(t *testing.T) {
 	serverConn := connectTestBus(t)
-	hook := &fakeHook{}
+	hook := &hooks.Testing{}
 	newTestManager(t, serverConn, hook)
 
 	clientConn := connectTestBus(t)
@@ -123,11 +81,9 @@ func TestStartUnit_OverDBus(t *testing.T) {
 		t.Fatal("StartUnit returned an empty job path")
 	}
 
-	hook.mu.Lock()
-	started := append([]string(nil), hook.started...)
-	hook.mu.Unlock()
+	started := hook.Started()
 	if len(started) != 1 || started[0] != "my-app.service" {
-		t.Fatalf("hook.started = %v, want [my-app.service]", started)
+		t.Fatalf("hook.Started() = %v, want [my-app.service]", started)
 	}
 
 	// Real systemctl blocks on JobRemoved before returning - assert both
@@ -162,7 +118,7 @@ func TestStartUnit_OverDBus(t *testing.T) {
 
 func TestKillUnit_OverDBus(t *testing.T) {
 	serverConn := connectTestBus(t)
-	hook := &fakeHook{}
+	hook := &hooks.Testing{}
 	newTestManager(t, serverConn, hook)
 
 	clientConn := connectTestBus(t)
@@ -175,10 +131,37 @@ func TestKillUnit_OverDBus(t *testing.T) {
 		t.Fatalf("KillUnit call: %v", call.Err)
 	}
 
-	hook.mu.Lock()
-	killed := append([]killCall(nil), hook.killed...)
-	hook.mu.Unlock()
-	if len(killed) != 1 || killed[0] != (killCall{"my-app.service", 9}) {
-		t.Fatalf("hook.killed = %v, want [{my-app.service 9}]", killed)
+	killed := hook.Killed()
+	if len(killed) != 1 || killed[0] != (hooks.TestingKillCall{Unit: "my-app.service", Signal: 9}) {
+		t.Fatalf("hook.Killed() = %v, want [{my-app.service 9}]", killed)
+	}
+}
+
+// TestManagerRunsWithoutAnyRealHook proves the shim's core D-Bus/systemd
+// surface works standalone - no Kubernetes, no cluster, nothing beyond
+// a bus to connect to - via the registered "noop" hook rather than
+// hooks.Testing (which only exists for tests).
+func TestManagerRunsWithoutAnyRealHook(t *testing.T) {
+	serverConn := connectTestBus(t)
+	hook, err := hooks.Load("noop")
+	if err != nil {
+		t.Fatalf("hooks.Load(noop): %v", err)
+	}
+	newTestManager(t, serverConn, hook)
+
+	clientConn := connectTestBus(t)
+	obj := clientConn.Object(testBusName, managerPath)
+
+	var jobPath dbus.ObjectPath
+	if err := obj.Call(managerIface+".StartUnit", 0, "my-app.service", "replace").Store(&jobPath); err != nil {
+		t.Fatalf("StartUnit call: %v", err)
+	}
+	if jobPath == "" {
+		t.Fatal("StartUnit returned an empty job path")
+	}
+
+	call := obj.Call(managerIface+".KillUnit", 0, "my-app.service", "all", int32(9))
+	if call.Err != nil {
+		t.Fatalf("KillUnit call: %v", call.Err)
 	}
 }

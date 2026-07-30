@@ -1,8 +1,9 @@
-module systemd1-shim
+module github.com/andsens/systemd1-shim
 
-go 1.22.0
+go 1.26.5
 
 require (
+	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
 	github.com/godbus/dbus/v5 v5.1.0
 	k8s.io/api v0.30.0
