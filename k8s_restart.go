@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -54,7 +55,7 @@ func NewK8sRestarter() (*K8sRestarter, error) {
 
 	podName := os.Getenv("POD_NAME")
 	if podName == "" {
-		logf("WARNING: POD_NAME is not set - wire it up via the Downward API " +
+		slog.Warn("POD_NAME is not set - wire it up via the Downward API " +
 			"(fieldRef: metadata.name) in the sidecar's env, see README.md. " +
 			"exec calls will fail until then.")
 	}
@@ -82,11 +83,9 @@ func NewK8sRestarter() (*K8sRestarter, error) {
 	}, nil
 }
 
-// loadUnitContainerMap reads UNIT_CONTAINER_MAP_FILE (a JSON file
-// {"unifi-network.service": "network-app", ...}) if set, and normalizes
-// its keys to always carry the ".service" suffix so lookups in
-// containerFor (which always looks up the normalized name) hit regardless
-// of how the user wrote the mapping file.
+// loadUnitContainerMap reads UNIT_CONTAINER_MAP_FILE if set, and
+// normalizes its keys to always carry the ".service" suffix so lookups
+// in containerFor hit regardless of how the user wrote the mapping file.
 func loadUnitContainerMap() (map[string]string, error) {
 	raw := map[string]string{}
 	if path := os.Getenv("UNIT_CONTAINER_MAP_FILE"); path != "" {
@@ -157,8 +156,9 @@ func (k *K8sRestarter) execIn(ctx context.Context, unitName string, command []st
 		return fmt.Errorf("exec %v in pod=%s container=%s: %w (stdout=%q stderr=%q)",
 			command, k.podName, container, streamErr, stdout.String(), stderr.String())
 	}
-	logf("k8s exec pod=%s container=%s command=%v: ok (stdout=%q stderr=%q)",
-		k.podName, container, command, stdout.String(), stderr.String())
+	slog.Info("k8s exec ok",
+		"pod", k.podName, "container", container, "command", command,
+		"stdout", stdout.String(), "stderr", stderr.String())
 	return nil
 }
 

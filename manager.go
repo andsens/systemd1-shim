@@ -71,9 +71,8 @@ type ProcessEntry struct {
 }
 
 // propString/propUint32 read a property's current value back out of a
-// prop.Properties instance. Used by the read-only listing methods below
-// (ListUnits, GetUnitByPID, ...) that need to report current state rather
-// than just answer a Properties.Get for a single named property.
+// prop.Properties instance, for the listing methods below that need to
+// report current state (ListUnits, GetUnitByPID, ...).
 func propString(p *prop.Properties, iface, name string) (string, error) {
 	v, derr := p.Get(iface, name)
 	if derr != nil {
@@ -138,7 +137,7 @@ func newManager(conn *dbus.Conn, units *UnitRegistry, hook Hook) (*Manager, erro
 	return m, nil
 }
 
-// --- Methods actually reachable from real systemctl invocations + unifi-core's own D-Bus client ---
+// --- Methods actually reachable from real systemctl invocations and other D-Bus clients ---
 
 func (m *Manager) Subscribe() *dbus.Error {
 	// Real systemd only starts emitting Job*/PropertiesChanged after this;
@@ -159,10 +158,8 @@ func (m *Manager) LoadUnit(name string) (dbus.ObjectPath, *dbus.Error) {
 }
 
 // GetUnit should, per real semantics, fail if the unit isn't already
-// loaded. We don't track that distinction - everything is created on
-// first reference regardless of which method asked for it - so this
-// behaves identically to LoadUnit. Fine for our purposes: nothing here
-// relies on GetUnit failing for an unknown unit.
+// loaded. We don't track that distinction, so this behaves identically
+// to LoadUnit - fine, since nothing relies on GetUnit failing here.
 func (m *Manager) GetUnit(name string) (dbus.ObjectPath, *dbus.Error) {
 	return m.LoadUnit(name)
 }

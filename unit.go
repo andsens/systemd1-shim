@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,14 +34,10 @@ func unitPath(name string) dbus.ObjectPath {
 	return dbus.ObjectPath("/org/freedesktop/systemd1/unit/" + b.String())
 }
 
-// Unit is one faked systemd unit: an exported D-Bus object at unitPath(name)
-// implementing org.freedesktop.systemd1.Unit and org.freedesktop.systemd1.Service
-// properties (backed by godbus's prop.Properties helper so Get/GetAll/
-// PropertiesChanged are handled for us), plus a handful of Unit-interface
-// methods (GetUnitFileState, Describe, Reload, Freeze, Thaw) mirroring
-// fakesystemD's surface.
+// Unit is one faked systemd unit, exported as a D-Bus object at
+// unitPath(name).
 type Unit struct {
-	Name   string // e.g. "unifi-network.service"
+	Name   string
 	Path   dbus.ObjectPath
 	conn   *dbus.Conn
 	props  *prop.Properties
@@ -84,9 +81,6 @@ func newUnit(conn *dbus.Conn, name string) (*Unit, error) {
 
 	u := &Unit{Name: name, Path: path, conn: conn, props: p}
 
-	// Unit-interface methods (GetUnitFileState, Describe, Reload, Freeze,
-	// Thaw - defined below), exported for dispatch the same way Manager's
-	// methods are.
 	if err := conn.Export(u, path, unitIface); err != nil {
 		return nil, err
 	}
@@ -106,13 +100,9 @@ func (u *Unit) setMainPID(pid uint32) {
 	u.props.SetMust(serviceIface, "MainPID", pid)
 }
 
-// --- org.freedesktop.systemd1.Unit methods ---
-//
-// These mirror the extra methods in the fakesystemD reference project
-// (GetUnitFileState, Describe, Reload, Freeze, Thaw). Nothing in
-// unifi-core or a plain systemctl enable/disable/restart/mask/unmask/kill
-// workflow calls these directly, but they're cheap to have in case
-// something else on the bus (or a future unifi-core version) does.
+// Nothing in a plain systemctl enable/disable/restart/mask/unmask/kill
+// workflow calls these directly, but they're cheap to have in case some
+// other D-Bus client does.
 
 func (u *Unit) GetUnitFileState() (string, *dbus.Error) {
 	v, derr := u.props.Get(unitIface, "UnitFileState")
@@ -127,12 +117,6 @@ func (u *Unit) GetUnitFileState() (string, *dbus.Error) {
 
 // Describe returns every property under org.freedesktop.systemd1.Unit as
 // a single a{sv} blob - equivalent to calling Properties.GetAll yourself.
-//
-// NOTE: this assumes prop.Properties.GetAll(iface) returns
-// map[string]dbus.Variant directly (matching the a{sv} wire shape). If
-// your godbus version's GetAll instead returns map[string]*prop.Prop (an
-// internal bookkeeping type with a .Value field rather than the Variant
-// itself), adjust this to wrap each entry: dbus.MakeVariant(p.Value).
 func (u *Unit) Describe() (map[string]dbus.Variant, *dbus.Error) {
 	return u.props.GetAll(unitIface)
 }
@@ -217,11 +201,9 @@ func normalizeUnitName(name string) string {
 	return name
 }
 
-// getOrCreate returns the Unit for name, exporting a new D-Bus object for it
-// the first time it's seen. This mirrors LoadUnit's real semantics of
-// "load if not already loaded" - we don't distinguish loaded/not-loaded,
-// everything just springs into existence on first reference, defaulting to
-// a healthy state (see README for why that default was chosen).
+// getOrCreate doesn't distinguish loaded/not-loaded like real systemd
+// does - everything springs into existence on first reference, defaulting
+// to a healthy state (see README for why).
 func (r *UnitRegistry) getOrCreate(name string) (*Unit, error) {
 	key := normalizeUnitName(name)
 	r.mu.Lock()
@@ -245,8 +227,8 @@ func (r *UnitRegistry) get(name string) (*Unit, bool) {
 	return u, ok
 }
 
-// all returns every currently-known unit. Safe to call while other
-// goroutines are creating new units - it snapshots under the lock.
+// all snapshots under the lock, so it's safe to call while other
+// goroutines are creating units.
 func (r *UnitRegistry) all() []*Unit {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -257,33 +239,26 @@ func (r *UnitRegistry) all() []*Unit {
 	return out
 }
 
-// --- Jobs ---
-//
-// Real systemd represents every asynchronous unit operation (start/stop/
-// restart) as a Job object, and `systemctl` (when not run with --no-block)
-// waits for a JobRemoved signal naming that exact job before it exits. We
-// don't need real concurrency here - each job we "create" runs its action
-// to completion (synchronously, e.g. the kubectl exec call) and then
-// immediately emits JobRemoved, but we still have to go through the
-// motions (return a job path from Start/Stop/RestartUnit, emit JobNew,
-// then JobRemoved) or `systemctl restart` will hang forever waiting for a
-// signal that never comes.
+// `systemctl` (without --no-block) waits for a JobRemoved signal naming
+// the job it triggered before it exits. We don't need real job
+// concurrency - each job we "create" runs its action synchronously and
+// immediately emits JobRemoved - but we still have to go through the
+// motions (job path, JobNew, JobRemoved) or systemctl hangs forever
+// waiting for a signal that never comes.
 
-var jobIDCounter uint32
+var jobIDCounter atomic.Uint32
 
 func nextJobID() uint32 {
-	return atomic.AddUint32(&jobIDCounter, 1)
+	return jobIDCounter.Add(1)
 }
 
 func jobPath(id uint32) dbus.ObjectPath {
 	return dbus.ObjectPath(fmt.Sprintf("/org/freedesktop/systemd1/job/%d", id))
 }
 
-// runJob emits JobNew, runs action synchronously, emits JobRemoved with
-// "done" or "failed", and returns the job path (for the method call's
-// return value) - errors from action are logged but not returned to the
-// D-Bus caller, matching how systemctl expects to learn about failure
-// (via the job result string, not a method error).
+// runJob logs action's error but doesn't return it to the D-Bus caller -
+// systemctl learns about failure via the job result string, not a method
+// error.
 func runJob(conn *dbus.Conn, unitName string, action func() error) dbus.ObjectPath {
 	id := nextJobID()
 	path := jobPath(id)
@@ -292,7 +267,7 @@ func runJob(conn *dbus.Conn, unitName string, action func() error) dbus.ObjectPa
 
 	result := "done"
 	if err := action(); err != nil {
-		logf("job %d (%s) failed: %v", id, unitName, err)
+		slog.Error("job failed", "job_id", id, "unit", unitName, "error", err)
 		result = "failed"
 	}
 

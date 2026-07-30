@@ -95,14 +95,16 @@ systemd1-shim --help
 
 ## Configuration (env vars)
 
-| Var                       | Default             | Purpose                                                                     |
-| ------------------------- | -------------------- | ---------------------------------------------------------------------------- |
-| `DBUS_SYSTEM_BUS_ADDRESS` | _(godbus default)_  | Only needed if your dbus socket isn't at the usual path both sides expect.  |
+| Var                       | Default            | Purpose                                                                    |
+| ------------------------- | ------------------ | -------------------------------------------------------------------------- |
+| `DBUS_SYSTEM_BUS_ADDRESS` | _(godbus default)_ | Only needed if your dbus socket isn't at the usual path both sides expect. |
 
 Hook-specific env vars are documented alongside each hook - see
 [k8s_restarter.md](k8s_restarter.md) for the `k8s` hook's.
 
 ## Comparison to fakesystemD (Python)
+
+https://github.com/grisuno/fakesystemD
 
 Extends fakesystemD's Manager/Unit surface (see "What's covered" above).
 Two functional differences remain:
