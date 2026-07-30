@@ -62,7 +62,7 @@ docker build -f Dockerfile.debian -t systemd1-shim .    # + a bundled dbus-daemo
 
 `Dockerfile.debian`'s dbus-daemon works standalone by default, or as the
 bus for a whole pod if you mount an emptyDir over `/run/dbus` in every
-container that needs it - see [deployment.yaml](deployment.yaml).
+container that needs it - see [example/k8s_restarter_deployment.yaml](example/k8s_restarter_deployment.yaml).
 
 ## Hooks
 
@@ -109,7 +109,7 @@ systemd1-shim --help
 - **`k8s`** - signals a sibling container's process directly, by PID
   (found via the Kubernetes API + `/proc`, no exec). See
   [k8s_restarter.md](hooks/k8s_restarter.md) and
-  [deployment.yaml](deployment.yaml) for a full sidecar example.
+  [example/k8s_restarter_deployment.yaml](example/k8s_restarter_deployment.yaml) for a full sidecar example.
 
 ## Configuration (env vars)
 
