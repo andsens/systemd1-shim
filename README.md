@@ -53,7 +53,15 @@ CGO_ENABLED=0 GOOS=linux go build -o systemd1-shim .
 ```
 
 Static binary - `FROM scratch` or `FROM gcr.io/distroless/static` both
-work as a base image.
+work as a base image. Two ready-made images:
+
+```bash
+docker build -f Dockerfile.scratch -t systemd1-shim .   # just the binary
+docker build -f Dockerfile.debian -t systemd1-shim .    # + a bundled dbus-daemon, no sidecar needed
+```
+
+`Dockerfile.debian` only works standalone - see its top comment for why
+it can't replace the shared-bus sidecar setup below.
 
 ## Hooks
 

@@ -1,0 +1,18 @@
+# syntax=docker/dockerfile:1
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/systemd1-shim .
+
+# No CA bundle needed: the "k8s" hook talks to the in-cluster API server
+# using the ServiceAccount-provided ca.crt, not the system trust store.
+# No USER directive: root is required so this can signal sibling
+# containers' processes (of possibly different UIDs) via the shared PID
+# namespace - see hooks/k8s_restarter.md.
+FROM scratch
+COPY --from=build /out/systemd1-shim /systemd1-shim
+ENTRYPOINT ["/systemd1-shim"]
