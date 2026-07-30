@@ -9,16 +9,19 @@ ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/systemd1-shim .
 
 # Bundles its own dbus-daemon so this runs standalone - no separate dbus
-# sidecar/emptyDir needed. dbus-system.conf listens at the same path
-# real system.conf does, so dbus.ConnectSystemBus() finds it via its own
-# default - no env var bridging or wrapper script required. But that
-# socket still lives in this container's own /run, invisible to sibling
-# containers - so this only works if nothing else in the pod (e.g. no
-# real systemctl in another container) needs to reach the same bus. For
-# the actual sidecar setup, use Dockerfile.scratch plus a shared
-# dbus-daemon instead (see hooks/k8s_restarter.md).
+# sidecar container needed. Uses the stock system.conf as-is (its <listen>
+# is what dbus.ConnectSystemBus() already defaults to, no env var bridging
+# needed) plus dbus-policy.conf, a small system.d drop-in granting
+# systemd1-shim the bus ownership stock system.conf's default policy would
+# otherwise deny. /run/dbus is created explicitly since nothing does that
+# automatically outside real systemd's socket activation. Mount an emptyDir
+# over /run/dbus (in this container and any siblings that need the same
+# bus, e.g. deployment.yaml) to share the socket instead of keeping it
+# private to this container.
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends dbus \
-	&& rm -rf /var/lib/apt/lists/*
+	&& rm -rf /var/lib/apt/lists/* \
+	&& mkdir -p /run/dbus
 COPY --from=build /out/systemd1-shim /systemd1-shim
-ENTRYPOINT ["dbus-run-session", "--config-file=/etc/dbus-1/shim-system.conf", "--", "/systemd1-shim"]
+COPY dbus-policy.conf /etc/dbus-1/system.d/systemd1-shim.conf
+ENTRYPOINT ["/bin/sh", "-c", "dbus-daemon --system --fork && exec /systemd1-shim \"$@\"", "sh"]

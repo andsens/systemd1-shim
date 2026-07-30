@@ -1,0 +1,57 @@
+---
+# Example sidecar deployment: systemd1-shim runs alongside an app
+# container that expects a real systemd1 on the bus (e.g. some tooling
+# inside it shells out to `systemctl restart <unit>`). systemd1-shim
+# intercepts those D-Bus calls and turns "restart <unit>" into "signal
+# that unit's container directly" via the k8s hook - see
+# hooks/k8s_restarter.md for how.
+#
+# This is the Dockerfile.debian image: it bundles its own dbus-daemon,
+# and mounting the same emptyDir over /run/dbus in both containers here
+# shares that socket instead of keeping it private - so the app
+# container just needs a dbus client (no dbus-daemon of its own).
+#
+# RBAC: apply hooks/k8s_restarter_sa.yaml first (in the same namespace),
+# then point serviceAccountName below at the ServiceAccount it creates.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-workload
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: my-workload }
+  template:
+    metadata:
+      labels: { app: my-workload }
+    spec:
+      serviceAccountName: my-workload-sa
+      shareProcessNamespace: true # required: lets systemd1-shim see and signal sibling processes
+      containers:
+        - name: my-app
+          image: your-app-image # only needs a dbus client - systemd1-shim's dbus-daemon publishes the socket below
+          volumeMounts:
+            - name: dbus-socket
+              mountPath: /run/dbus
+
+        - name: systemd1-shim
+          image: ghcr.io/andsens/systemd1-shim:latest-debian
+          args: ["--hook=k8s"]
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            # One SD1_SHIM_K8S_MAP_<UNIT_NAME> entry per unit whose name
+            # doesn't already match its container name - see
+            # hooks/k8s_restarter.md. Drop this if "my-app.service"
+            # mapping to the "my-app" container above is all you need.
+            - name: SD1_SHIM_K8S_MAP_MY_APP
+              value: my-app
+          volumeMounts:
+            - name: dbus-socket
+              mountPath: /run/dbus
+
+      volumes:
+        - name: dbus-socket
+          emptyDir: {}

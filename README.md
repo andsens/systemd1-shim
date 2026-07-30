@@ -57,11 +57,12 @@ work as a base image. Two ready-made images:
 
 ```bash
 docker build -f Dockerfile.scratch -t systemd1-shim .   # just the binary
-docker build -f Dockerfile.debian -t systemd1-shim .    # + a bundled dbus-daemon, no sidecar needed
+docker build -f Dockerfile.debian -t systemd1-shim .    # + a bundled dbus-daemon
 ```
 
-`Dockerfile.debian` only works standalone - see its top comment for why
-it can't replace the shared-bus sidecar setup below.
+`Dockerfile.debian`'s dbus-daemon works standalone by default, or as the
+bus for a whole pod if you mount an emptyDir over `/run/dbus` in every
+container that needs it - see [deployment.yaml](deployment.yaml).
 
 ## Hooks
 
@@ -107,7 +108,8 @@ systemd1-shim --help
   restart anything.
 - **`k8s`** - signals a sibling container's process directly, by PID
   (found via the Kubernetes API + `/proc`, no exec). See
-  [k8s_restarter.md](hooks/k8s_restarter.md).
+  [k8s_restarter.md](hooks/k8s_restarter.md) and
+  [deployment.yaml](deployment.yaml) for a full sidecar example.
 
 ## Configuration (env vars)
 
