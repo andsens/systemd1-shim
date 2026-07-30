@@ -1,49 +1,51 @@
 package hooks
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
 )
 
-// K8sRestarter is the "k8s" Hook: it reacts to unit commands using the
-// Kubernetes API's pod/exec subresource directly (the client-go
-// equivalent of `kubectl exec`), rather than shelling out to a `kubectl`
-// binary. Needs to run with in-cluster credentials (a mounted
-// ServiceAccount token) and RBAC granting `create` on `pods/exec` for its
-// own pod - same permission `kubectl exec` would need, just exercised
-// without a subprocess.
+// K8sRestarter is the "k8s" Hook: it signals a sibling container's main
+// process directly, by PID. Requires shareProcessNamespace: true on the
+// pod, and RBAC granting `get` on `pods` (to read ContainerStatuses).
 type K8sRestarter struct {
-	clientset      *kubernetes.Clientset
-	restConfig     *rest.Config
-	podName        string
-	namespace      string
-	unitContainers map[string]string
-	timeout        time.Duration
+	clientset kubernetes.Interface
+	podName   string
+	namespace string
 }
+
+// apiCallTimeout bounds the one Kubernetes API call this hook makes -
+// not worth making configurable for a single read.
+const apiCallTimeout = 30 * time.Second
 
 func init() {
 	register("k8s", func() (Hook, error) { return NewK8sRestarter() })
 }
 
-// NewK8sRestarter reads everything it needs from the environment - see
-// README.md's "Configuration (env vars)" table. It's all specific to this
-// hook (which pod/namespace to exec into, how to map a unit name to a
-// container), so it lives here rather than in some shared config layer
-// main.go would otherwise have to know about.
+// NewK8sRestarter reads its config from env vars - see README.md.
 func NewK8sRestarter() (*K8sRestarter, error) {
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		slog.Warn("POD_NAME is not set - wire it up via the Downward API " +
+			"(fieldRef: metadata.name) in the sidecar's env, see README.md. " +
+			"restart/stop/kill calls will fail until then.")
+	}
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = "default"
+	}
+
 	restConfig, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("loading in-cluster kubeconfig (are you actually running in a pod, with a ServiceAccount mounted?): %w", err)
@@ -53,153 +55,128 @@ func NewK8sRestarter() (*K8sRestarter, error) {
 		return nil, fmt.Errorf("building Kubernetes clientset: %w", err)
 	}
 
-	podName := os.Getenv("POD_NAME")
-	if podName == "" {
-		slog.Warn("POD_NAME is not set - wire it up via the Downward API " +
-			"(fieldRef: metadata.name) in the sidecar's env, see README.md. " +
-			"exec calls will fail until then.")
-	}
-	namespace := getenvDefault("POD_NAMESPACE", "default")
-
-	timeout := 30 * time.Second
-	if s := os.Getenv("EXEC_TIMEOUT_SECONDS"); s != "" {
-		if n, err := strconv.Atoi(s); err == nil {
-			timeout = time.Duration(n) * time.Second
-		}
-	}
-
-	unitContainers, err := loadUnitContainerMap()
-	if err != nil {
-		return nil, err
-	}
-
 	return &K8sRestarter{
-		clientset:      clientset,
-		restConfig:     restConfig,
-		podName:        podName,
-		namespace:      namespace,
-		unitContainers: unitContainers,
-		timeout:        timeout,
+		clientset: clientset,
+		podName:   podName,
+		namespace: namespace,
 	}, nil
 }
 
-// normalizeUnitName mirrors main package's unit.go copy - kept local
-// rather than shared, since hooks can't import main (main imports
-// hooks) and this is a four-line pure function, not worth a third
-// package just to share it.
-func normalizeUnitName(name string) string {
-	if !strings.HasSuffix(name, ".service") {
-		return name + ".service"
-	}
-	return name
-}
+const unitContainerEnvPrefix = "SD1_SHIM_K8S_MAP_"
 
-// loadUnitContainerMap reads UNIT_CONTAINER_MAP_FILE if set, and
-// normalizes its keys to always carry the ".service" suffix so lookups
-// in containerFor hit regardless of how the user wrote the mapping file.
-func loadUnitContainerMap() (map[string]string, error) {
-	raw := map[string]string{}
-	if path := os.Getenv("UNIT_CONTAINER_MAP_FILE"); path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(data, &raw); err != nil {
-			return nil, err
-		}
-	}
-	normalized := make(map[string]string, len(raw))
-	for k, v := range raw {
-		normalized[normalizeUnitName(k)] = v
-	}
-	return normalized, nil
-}
-
-func getenvDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
+// containerFor maps a unit name to a container name via
+// SD1_SHIM_K8S_MAP_<UNIT_NAME> (suffix stripped, uppercased, '-' turned
+// into '_'):
+//
+//	env:
+//	  - name: SD1_SHIM_K8S_MAP_MY_APP
+//	    value: my-app-container
+//
+// Falls back to the unit name itself (suffix stripped) if that's unset.
 func (k *K8sRestarter) containerFor(unitName string) string {
-	if c, ok := k.unitContainers[unitName]; ok {
+	base := strings.TrimSuffix(unitName, ".service")
+	envName := unitContainerEnvPrefix + strings.ToUpper(strings.ReplaceAll(base, "-", "_"))
+	if c := os.Getenv(envName); c != "" {
 		return c
 	}
-	return strings.TrimSuffix(unitName, ".service")
+	return base
 }
 
-// execIn runs command inside the sibling container via the pods/exec
-// subresource - this is exactly what `kubectl exec` does internally,
-// just called directly instead of through a subprocess.
-func (k *K8sRestarter) execIn(ctx context.Context, unitName string, command []string) error {
+func (k *K8sRestarter) containerIDFor(ctx context.Context, containerName string) (string, error) {
+	pod, err := k.clientset.CoreV1().Pods(k.namespace).Get(ctx, k.podName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("getting pod %s/%s: %w", k.namespace, k.podName, err)
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name != containerName {
+			continue
+		}
+		if cs.ContainerID == "" {
+			return "", fmt.Errorf("container %q has no ContainerID yet (not started?)", containerName)
+		}
+		if i := strings.Index(cs.ContainerID, "://"); i != -1 {
+			return cs.ContainerID[i+3:], nil
+		}
+		return cs.ContainerID, nil
+	}
+	return "", fmt.Errorf("no container named %q in pod %s/%s", containerName, k.namespace, k.podName)
+}
+
+// pidForContainer correlates a container ID to a PID via /proc/*/cgroup
+// - Kubernetes doesn't expose this directly. Among matches, the lowest
+// PID is the entrypoint; the rest are children spawned later.
+func pidForContainer(procRoot, containerID string) (int, error) {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return 0, fmt.Errorf("reading %s: %w", procRoot, err)
+	}
+
+	best := 0
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue // not a PID directory (e.g. "self", "meminfo")
+		}
+		cgroup, err := os.ReadFile(filepath.Join(procRoot, entry.Name(), "cgroup"))
+		if err != nil {
+			continue // process exited mid-scan, or unreadable - skip it
+		}
+		if !strings.Contains(string(cgroup), containerID) {
+			continue
+		}
+		if best == 0 || pid < best {
+			best = pid
+		}
+	}
+	if best == 0 {
+		return 0, fmt.Errorf("no process found for container %s - is shareProcessNamespace: true set on the pod?", containerID)
+	}
+	return best, nil
+}
+
+func (k *K8sRestarter) signalContainer(ctx context.Context, unitName string, sig syscall.Signal) error {
 	if k.podName == "" {
 		return fmt.Errorf("POD_NAME is not set - see README.md (Downward API)")
 	}
 	container := k.containerFor(unitName)
 
-	req := k.clientset.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(k.podName).
-		Namespace(k.namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: container,
-			Command:   command,
-			Stdin:     false,
-			Stdout:    true,
-			Stderr:    true,
-			TTY:       false,
-		}, scheme.ParameterCodec)
-
-	executor, err := remotecommand.NewSPDYExecutor(k.restConfig, "POST", req.URL())
+	containerID, err := k.containerIDFor(ctx, container)
 	if err != nil {
-		return fmt.Errorf("building exec stream for pod=%s container=%s: %w", k.podName, container, err)
+		return err
 	}
-
-	var stdout, stderr bytes.Buffer
-	streamErr := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: &stdout,
-		Stderr: &stderr,
-		Tty:    false,
-	})
-	if streamErr != nil {
-		return fmt.Errorf("exec %v in pod=%s container=%s: %w (stdout=%q stderr=%q)",
-			command, k.podName, container, streamErr, stdout.String(), stderr.String())
+	pid, err := pidForContainer("/proc", containerID)
+	if err != nil {
+		return fmt.Errorf("finding PID for container %s: %w", container, err)
 	}
-	slog.Info("k8s exec ok",
-		"pod", k.podName, "container", container, "command", command,
-		"stdout", stdout.String(), "stderr", stderr.String())
+	if err := syscall.Kill(pid, sig); err != nil {
+		return fmt.Errorf("signaling pid %d (container %s) with %v: %w", pid, container, sig, err)
+	}
+	slog.Info("signaled container", "container", container, "pid", pid, "signal", sig)
 	return nil
 }
 
-// killall5 (sysvinit-utils) signals every process in the target
-// container other than PID 1 - see README.md for why this is the chosen
-// primitive and its limitations (it's blunt if a container runs more
-// than one supervised process).
 func (k *K8sRestarter) Restart(unitName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
-	return k.execIn(ctx, unitName, []string{"/sbin/killall5", "-15"})
+	return k.signalContainer(ctx, unitName, syscall.SIGTERM)
 }
 
 func (k *K8sRestarter) Stop(unitName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
-	return k.execIn(ctx, unitName, []string{"/sbin/killall5", "-15"})
+	return k.signalContainer(ctx, unitName, syscall.SIGTERM)
 }
 
 func (k *K8sRestarter) Start(unitName string) error {
-	// Kubernetes keeps containers running per their restartPolicy - there's
-	// no generic "start it from outside" primitive short of the container
-	// already being up. Treat as a no-op success; if the container is
-	// genuinely down, the next real action (Restart/Kill) will surface a
-	// failure from execIn instead of a fake success here.
+	// No generic way to start a container from outside - Kubernetes
+	// already keeps it running per restartPolicy. If it's actually down,
+	// the next Restart/Kill call surfaces that failure instead of a fake
+	// success here.
 	return nil
 }
 
 func (k *K8sRestarter) Kill(unitName string, signal int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
-	return k.execIn(ctx, unitName, []string{"/sbin/killall5", fmt.Sprintf("-%d", signal)})
+	return k.signalContainer(ctx, unitName, syscall.Signal(signal))
 }

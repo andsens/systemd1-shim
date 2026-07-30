@@ -15,7 +15,6 @@ type Testing struct {
 	Err error
 }
 
-// TestingKillCall records one Kill call's arguments.
 type TestingKillCall struct {
 	Unit   string
 	Signal int

@@ -97,7 +97,8 @@ systemd1-shim --help
   external dependency of any kind - lets the D-Bus/systemctl-facing
   surface run standalone. `--hook=k8s` is required for it to actually
   restart anything.
-- **`k8s`** - execs into a sibling container via the Kubernetes API. See
+- **`k8s`** - signals a sibling container's process directly, by PID
+  (found via the Kubernetes API + `/proc`, no exec). See
   [k8s_restarter.md](hooks/k8s_restarter.md).
 
 ## Configuration (env vars)

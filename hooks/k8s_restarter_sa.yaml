@@ -1,9 +1,14 @@
 # Permissions the "k8s" hook needs: a ServiceAccount for the workload
-# pod, and a Role/RoleBinding granting it `create` on `pods/exec` so
-# k8s_restarter.go can exec into a sibling container. See k8s_restarter.md.
+# pod, and a Role/RoleBinding granting it `get` on `pods` so
+# k8s_restarter.go can read its own pod's ContainerStatuses (to find a
+# sibling container's ID, then correlate that to a PID via /proc - see
+# k8s_restarter.md). Read-only: nothing here can execute code in, or
+# inject, a container.
 #
 # Apply in the same namespace as the pod (kubectl apply -n <ns> -f ...),
 # and set spec.serviceAccountName on the pod to the ServiceAccount below.
+# The pod itself also needs shareProcessNamespace: true - see
+# k8s_restarter.md's sidecar spec sketch.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -12,22 +17,22 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: systemd1-shim-exec
+  name: systemd1-shim-pod-get
 rules:
   - apiGroups: [""]
-    resources: ["pods/exec"]
-    verbs: ["create"]
+    resources: ["pods"]
+    verbs: ["get"]
     # Restrict to specific pod names if you template this per-pod:
     # resourceNames: ["my-pod-name"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: systemd1-shim-exec
+  name: systemd1-shim-pod-get
 subjects:
   - kind: ServiceAccount
     name: my-workload-sa
 roleRef:
   kind: Role
-  name: systemd1-shim-exec
+  name: systemd1-shim-pod-get
   apiGroup: rbac.authorization.k8s.io

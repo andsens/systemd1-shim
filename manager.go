@@ -123,18 +123,11 @@ func newManager(conn *dbus.Conn, hook hooks.Hook) (*Manager, error) {
 	return m, nil
 }
 
-func normalizeUnitName(name string) string {
-	if !strings.HasSuffix(name, ".service") {
-		return name + ".service"
-	}
-	return name
-}
-
 // getOrCreateUnit doesn't distinguish loaded/not-loaded like real systemd
 // does - everything springs into existence on first reference, defaulting
 // to a healthy state (see README for why).
 func (m *Manager) getOrCreateUnit(name string) (*Unit, error) {
-	key := normalizeUnitName(name)
+	key := strings.TrimSuffix(name, ".service") + ".service"
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if u, ok := m.units[key]; ok {
@@ -149,7 +142,7 @@ func (m *Manager) getOrCreateUnit(name string) (*Unit, error) {
 }
 
 func (m *Manager) getUnit(name string) (*Unit, bool) {
-	key := normalizeUnitName(name)
+	key := strings.TrimSuffix(name, ".service") + ".service"
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	u, ok := m.units[key]
