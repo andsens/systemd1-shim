@@ -6,7 +6,7 @@ require (
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815
 	github.com/godbus/dbus/v5 v5.2.2
-	k8s.io/api v0.36.3
+	k8s.io/api v0.36.4
 	k8s.io/apimachinery v0.36.4
 	k8s.io/client-go v0.36.3
 )
